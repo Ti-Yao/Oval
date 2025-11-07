@@ -1,0 +1,6 @@
+*.nii.gz
+*.h5
+*.gif
+*neptune
+__pycache__
+*dcm
