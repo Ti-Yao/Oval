@@ -11,19 +11,21 @@ import matplotlib.animation as animation
 import skimage
 import nibabel as nib
 from PIL import Image, ImageDraw
-
+import re
 import streamlit as st
 from streamlit_image_coordinates import streamlit_image_coordinates
 
-from losses import *
-from layer_util import *
-from unet3plus import *
 from scipy.interpolate import CubicSpline
 import pandas as pd
 import glob
 from scipy.ndimage import zoom
 import pydicom
 from datetime import datetime
+
+from array_ops import *
+from losses import *
+from layer_util import *
+from unet3plus import *
 
 vessels_dict = {'lpa':1,'rpa':2,'ao':3,'svc':4,'ivc':5}
 skip = 5
@@ -85,7 +87,7 @@ def create_complex_image(magnitude, phase): # magnitude is a real number tensor;
     
     return complex_image
 
-def make_video(image, pred_mask, vessel, save_path):
+def make_video(image, pred_mask, vessel, save_path, alpha = 0.5):
     fig, ax = plt.subplots(1,1, figsize = (5,5))
     frames = []
     for i in range(image.shape[2]):
@@ -94,7 +96,7 @@ def make_video(image, pred_mask, vessel, save_path):
 
         ax.axis('off')
         artists = [p1,text]
-        artists.append(ax.imshow(pred_mask[...,i],alpha = pred_mask[...,i] * 0.5, cmap = colormaps[vessel]))
+        artists.append(ax.imshow(pred_mask[...,i],alpha = pred_mask[...,i] * alpha, cmap = colormaps[vessel]))
         frames.append(artists)
     ani = animation.ArtistAnimation(fig, frames)
     plt.subplots_adjust(left = 0, right = 1, bottom = 0, top = 1)
@@ -179,6 +181,14 @@ def get_ellipse_coords(point, radius=5):
     return (x - radius, y - radius, x + radius, y + radius)
 
 
+def calculate_flow(phase_image, mask, rr, vessel):
+    flow_curve = calculate_curve(mask, phase_image, vessel)
+    flow_curve = interpolate_curve(flow_curve, rr)
+    flow = np.mean(flow_curve) * 0.06
+    total_volume = np.sum(flow_curve)/1000
+    forward_volume = np.sum(flow_curve[flow_curve>0])/1000
+    backward_volume = abs(np.sum(flow_curve[flow_curve<0])/1000)
+    return flow_curve, flow, total_volume, forward_volume, backward_volume
 
 def read_dicom_header(dicoms_in_series):
     '''
@@ -273,7 +283,7 @@ def read_dicom_header(dicoms_in_series):
             dicom_info[dicom_path]['uid'] =  '.'.join(dcm.SOPInstanceUID.split('.')[-2:])
             dicom_info[dicom_path]['seriesuid'] =  dcm.SeriesInstanceUID
             dicom_info[dicom_path]['manufacturer'] = manufacturer.lower()
-            dicom_info[dicom_path]['patient'] = dcm.PatientName
+            dicom_info[dicom_path]['patient'] = str(dcm.PatientName)
             dicom_info[dicom_path]['studydate'] = dcm.StudyDate
             
             
@@ -314,6 +324,7 @@ def read_dicom_header(dicoms_in_series):
                 dicom_info[dicom_path]['slicelocation'] = round(dcm.SliceLocation,3)
             except:
                 dicom_info[dicom_path]['slicelocation'] = np.nan
+
     dicom_info = pd.DataFrame.from_dict(dicom_info, orient = 'index').reset_index().rename(columns={'index': 'dicom'}).sort_values(['triggertime','slicelocation']) # put dicom info for all images into a dataframe
     return dicom_info, manufacturer
 
@@ -324,6 +335,7 @@ def get_image(data_path, mag_series_uid, phase_series_uid):
     phase_dir = glob.glob(f'{data_path}/**/{phase_series_uid}', recursive=True)[0]
     mag_dicoms = glob.glob(f'{mag_dir}/**/*.dcm', recursive=True)
     phase_dicoms = glob.glob(f'{phase_dir}/**/*.dcm', recursive=True)
+    
     dicoms_in_series = np.unique(mag_dicoms + phase_dicoms)
 
     dicom_info, manufacturer = read_dicom_header(dicoms_in_series)
@@ -349,7 +361,6 @@ def get_image(data_path, mag_series_uid, phase_series_uid):
             scale = phase_df.iloc[0]['scale']
             velocity = np.divide(phase_image, mag_image, out=np.zeros_like(phase_image, dtype=float), where=mag_image != 0) * scale
             phase_image = velocity 
-            print('magnitude-weighted')
             
     ps = float(phase_df.iloc[0].pixelspacing[0])
     frames = mag_image.shape[-1]
@@ -369,5 +380,38 @@ def get_image(data_path, mag_series_uid, phase_series_uid):
     patient =  mag_df.patient.iloc[0]
     study_date =  mag_df.studydate.iloc[0]
     study_date = datetime.strptime(study_date, "%Y%m%d").strftime("%m-%d-%Y")
-
     return image, venc, rr, description, patient, study_date
+
+
+def combine_gif_png(gif_path, png_path, output_path):
+    """
+    Combine the segmentation GIF and the flow curve PNG side by side,
+    resizing the PNG relative to the GIF height by a scale factor.
+    """
+    scale_factor=1
+    gif = Image.open(gif_path)
+    png = Image.open(png_path).convert("RGBA")
+
+    gif_height = gif.height
+    target_height = int(gif_height * scale_factor)
+
+    # Resize PNG with aspect ratio preserved
+    png_width = int(png.width * (target_height / png.height))
+    png_resized = png.resize((png_width, target_height), Image.LANCZOS)
+
+    frames = []
+    try:
+        while True:
+            gif_frame = gif.copy().convert("RGBA")
+            combined = Image.new("RGBA", (gif.width + png_resized.width, gif_height))
+
+            # Paste GIF and vertically center PNG
+            combined.paste(gif_frame, (0, 0))
+            y_offset = (gif_height - target_height) // 2
+            combined.paste(png_resized, (gif.width, y_offset))
+            frames.append(combined)
+            gif.seek(gif.tell() + 1)
+    except EOFError:
+        pass
+
+    frames[0].save(output_path, save_all=True, append_images=frames[1:], loop=0)
