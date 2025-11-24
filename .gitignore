@@ -1,3 +1,4 @@
+*.csv
 *.nii.gz
 *.h5
 *.gif

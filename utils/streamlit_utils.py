@@ -54,7 +54,10 @@ colormaps = {k:colormaps[k] for k in vessels_dict.keys()}
 image_size = 96
 frames = 32
 
-
+min_timesteps = 10
+max_timesteps = 55
+min_venc = 20
+max_venc = 500
 
 def normalise(image):
     if np.max(image) != 0:
@@ -112,7 +115,7 @@ def get_crop_coords(coords):
 
 def segment_image(image, venc, model, x_min, x_max, y_min, y_max):
     mag_image = image[...,0]
-    phase_image = image[...,0]
+    phase_image = image[...,0] # ************************************************* THIS NEEDS CHANGING IF THE MODEL CHANGES *************************************************
     mag_image[mag_image<1e-10] = 0                
     max_val = np.max(phase_image)
     angles = phase2angle(phase_image, venc)
@@ -146,7 +149,7 @@ def segment_image(image, venc, model, x_min, x_max, y_min, y_max):
     return mag_image, pred_mask, full_pred_mask
 
 def calculate_curve(mask, phase_image, vessel):
-    ps = 1 if mask.shape[0] == 256 else 2
+    ps = 1 # pixel spacing in mm
     pixel_area = ps **2 / 100  # convert mm2 to cm2
     phase = mask * phase_image
     v_curve = np.sum(np.sum(phase*pixel_area ,0),0) # cm3/s
@@ -189,6 +192,28 @@ def calculate_flow(phase_image, mask, rr, vessel):
     forward_volume = np.sum(flow_curve[flow_curve>0])/1000
     backward_volume = abs(np.sum(flow_curve[flow_curve<0])/1000)
     return flow_curve, flow, total_volume, forward_volume, backward_volume
+
+def convert_time_to_seconds(time_str):
+    """
+    Converts a time string in the format HHMMSS.FFFFFF into total seconds.
+    """
+    # Split hours, minutes, seconds, and fractional part
+    if '.' in time_str:
+        time_part, frac_part = time_str.split('.')
+        fractional_seconds = float('0.' + frac_part)
+    else:
+        time_part = time_str
+        fractional_seconds = 0.0
+
+    hours = int(time_part[:2])
+    minutes = int(time_part[2:4])
+    seconds = int(time_part[4:6])
+
+    total_seconds = hours * 3600 + minutes * 60 + seconds + fractional_seconds
+    return total_seconds
+
+
+
 
 def read_dicom_header(dicoms_in_series):
     '''
@@ -285,7 +310,7 @@ def read_dicom_header(dicoms_in_series):
             dicom_info[dicom_path]['manufacturer'] = manufacturer.lower()
             dicom_info[dicom_path]['patient'] = str(dcm.PatientName)
             dicom_info[dicom_path]['studydate'] = dcm.StudyDate
-            
+                 
             
             rr_ni, rr_hr = 0, 0
             try:
@@ -304,6 +329,15 @@ def read_dicom_header(dicoms_in_series):
                 dicom_info[dicom_path]['seriesdescription'] = dcm.SeriesDescription.lower()
             except:
                 dicom_info[dicom_path]['seriesdescription'] = ''
+            
+            try:
+                try:
+                    dicom_info[dicom_path]['creationtime'] =  convert_time_to_seconds(dcm.InstanceCreationTime)
+                except:
+                    dicom_info[dicom_path]['creationtime'] = convert_time_to_seconds(dcm[0x0008, 0x0033].value)
+            except:
+                dicom_info[dicom_path]['creationtime'] = 0
+                
             try:
                 dicom_info[dicom_path]['pixelspacing'] = dcm.PixelSpacing
             except:
@@ -324,63 +358,249 @@ def read_dicom_header(dicoms_in_series):
                 dicom_info[dicom_path]['slicelocation'] = round(dcm.SliceLocation,3)
             except:
                 dicom_info[dicom_path]['slicelocation'] = np.nan
-
-    dicom_info = pd.DataFrame.from_dict(dicom_info, orient = 'index').reset_index().rename(columns={'index': 'dicom'}).sort_values(['triggertime','slicelocation']) # put dicom info for all images into a dataframe
-    return dicom_info, manufacturer
-
-
-
-def get_image(data_path, mag_series_uid, phase_series_uid):
-    mag_dir = glob.glob(f'{data_path}/**/{mag_series_uid}', recursive=True)[0]
-    phase_dir = glob.glob(f'{data_path}/**/{phase_series_uid}', recursive=True)[0]
-    mag_dicoms = glob.glob(f'{mag_dir}/**/*.dcm', recursive=True)
-    phase_dicoms = glob.glob(f'{phase_dir}/**/*.dcm', recursive=True)
-    
-    dicoms_in_series = np.unique(mag_dicoms + phase_dicoms)
-
-    dicom_info, manufacturer = read_dicom_header(dicoms_in_series)
-
-    if 'ge' in manufacturer.lower(): # split phase-contrast into mag and phase
-        mag_df, phase_df = [x for _ , x in dicom_info.groupby(dicom_info.image.apply(lambda x: x.min()< 0))]
-    else:
-        phase_df, mag_df = [x for _ , x in dicom_info.groupby(dicom_info['venc'] == 0)]
-
-    mag_df = mag_df.drop_duplicates(subset = ['uid'])
-    mag_tt = mag_df.triggertime.unique()
-    mag_df = mag_df.loc[mag_df['seriesuid'] == mag_df['seriesuid'].iloc[0]]
-    phase_df = phase_df.drop_duplicates(subset = ['uid'])
-    phase_df = phase_df[phase_df['triggertime'].isin(mag_tt)]
-    phase_df = phase_df.loc[phase_df['venc'] == np.max(phase_df['venc'])]
-
-    phase_image = np.stack(phase_df['image'], -1)
-    mag_image = np.stack(mag_df['image'], -1)
-
-    if 'ge' in manufacturer.lower(): # GE needs extra processing for velocity
-        vas_flag = phase_df.iloc[0]['vas_flag']
-        if vas_flag != 0:
-            scale = phase_df.iloc[0]['scale']
-            velocity = np.divide(phase_image, mag_image, out=np.zeros_like(phase_image, dtype=float), where=mag_image != 0) * scale
-            phase_image = velocity 
+            try:
+                dicom_info[dicom_path]['seriesnumber'] = round(dcm.SeriesNumber,3)
+            except:
+                dicom_info[dicom_path]['seriesnumber'] = series_num
             
-    ps = float(phase_df.iloc[0].pixelspacing[0])
-    frames = mag_image.shape[-1]
-    ratio = 32/frames
-    mag_image = zoom(mag_image, [ps, ps, ratio], order = 1) # resize magnitude to 1x1x1mm
-    phase_image = zoom(phase_image, [ps, ps, ratio], order = 1) # resize phase to 1x1x1mm
+        
+    
+    dicom_info = pd.DataFrame.from_dict(dicom_info, orient = 'index').reset_index().rename(columns={'index': 'dicom'}).sort_values(['triggertime','slicelocation']) # put dicom info for all images into a dataframe
+    return dicom_info
 
-    max_size = 256
+class OvalPipeline:
+    def __init__(self, data_path, mag_series_uid, phase_series_uid):
+        mag_dir = glob.glob(f'{data_path}/**/{mag_series_uid}', recursive=True)[0]
+        phase_dir = glob.glob(f'{data_path}/**/{phase_series_uid}', recursive=True)[0]
+        mag_dicoms = glob.glob(f'{mag_dir}/**/*.dcm', recursive=True)
+        phase_dicoms = glob.glob(f'{phase_dir}/**/*.dcm', recursive=True)
+        self.dicom_info = self.get_dicom_info(mag_dicoms, phase_dicoms)
+        self.stack_df_list = self.get_stack_df_list(self.dicom_info)
+        self.image = self.get_images(self.stack_df_list)
 
-    mag_image = tf.image.resize_with_crop_or_pad(mag_image, max_size, max_size) # crop or pad images to 256x256
-    phase_image = tf.image.resize_with_crop_or_pad(phase_image, max_size, max_size)  # crop or pad images to 256x256
 
-    image = np.stack([mag_image, phase_image], -1) # combine magnitude and phase together
-    venc = phase_df.venc.max()
-    rr =  phase_df.rr.max()
-    description =  mag_df.seriesdescription.iloc[0]
-    patient =  mag_df.patient.iloc[0]
-    study_date =  mag_df.studydate.iloc[0]
-    study_date = datetime.strptime(study_date, "%Y%m%d").strftime("%m-%d-%Y")
-    return image, venc, rr, description, patient, study_date
+    def get_dicom_info(self, mag_dicoms, phase_dicoms):
+        dicoms_in_series = np.unique(mag_dicoms + phase_dicoms)
+        dicom_info = read_dicom_header(dicoms_in_series)
+        self.manufacturer = dicom_info.iloc[0].manufacturer
+        dicom_info = dicom_info.drop(columns = ['manufacturer'])
+        dicom_info = dicom_info.dropna(subset=['orientation', 'position'])
+        dicom_info['orientation'] = dicom_info['orientation'].apply(tuple)
+        dicom_info['position'] = dicom_info['position'].apply(tuple)
+
+        return dicom_info
+    
+    def match_image_planes(self, dicom_info):
+        cine_df_list = []
+        grouped = dicom_info.groupby(['orientation', 'position','scale'], dropna=False)
+
+        for _, group_df in grouped:
+            enough_frames = len(group_df) > (min_timesteps * 2)
+            venc_in_range = ((group_df.venc > min_venc) & (group_df.venc < max_venc)).any()
+
+            if venc_in_range and enough_frames:
+                sorted_df = group_df.sort_values(['triggertime', 'creationtime'])
+                cine_df_list.append(sorted_df)
+        return cine_df_list
+
+    def split_mag_phase_df(self, stack_df):
+        mag_df = pd.DataFrame()
+        phase_df = pd.DataFrame()
+
+        if 'ge' in self.manufacturer.lower():
+            groups = list(stack_df.groupby(stack_df.image.apply(lambda x: x.min() < 0)))
+            if len(groups) == 2:
+                mag_df, phase_df = [g[1] for g in groups]
+            elif len(groups) == 1:
+                # Assign group based on the boolean key
+                key, df = groups[0]
+                if key:  # True group, which one should it be?
+                    mag_df = df
+                else:
+                    phase_df = df
+        else:
+            groups = list(stack_df.groupby(stack_df['venc'] == 0))
+            if len(groups) == 2:
+                phase_df, mag_df = [g[1] for g in groups]
+            elif len(groups) == 1:
+                key, df = groups[0]
+                if key:
+                    phase_df = df
+                else:
+                    mag_df = df
+
+        return mag_df, phase_df
+        
+    def get_multi_series_phase_contrast(self, dicom_info):
+        
+        stack_df_list = []
+        dicom_info = dicom_info.groupby('seriesuid').filter(lambda g: g['position'].nunique() == 1) # clean 4D data
+        cine_df_list = self.match_image_planes(dicom_info)
+        print(len(cine_df_list))
+
+        for cine_df in cine_df_list:
+            mag_df, phase_df = self.split_mag_phase_df(cine_df)
+            if mag_df.empty or phase_df.empty:
+                self.missing_data_flag = True
+                continue
+
+
+            self.has_creationtime = mag_df['creationtime'].nunique() > 1
+
+            has_creationtime = mag_df['creationtime'].nunique() > 1
+            has_seriesnumber = dicom_info.seriesnumber.nunique() > 1
+
+            print(has_creationtime, has_seriesnumber)
+
+            scenario_2 = has_creationtime and not has_seriesnumber
+            scenario_3 = not has_creationtime and not has_seriesnumber
+
+            # Match series by closest mean creation time
+
+            if scenario_2 or scenario_3:                
+                matches = {}
+                mag_times = mag_df.groupby('seriesuid')['creationtime'].mean()
+                phase_times = phase_df.groupby('seriesuid')['creationtime'].mean()
+
+                for mag_uid, mag_time in mag_times.items():
+                    time_diff = (phase_times - mag_time).abs()
+                    min_time_diff = time_diff.min()
+                    phase_uids = time_diff.loc[abs(time_diff - min_time_diff) < 0.5].index.tolist()
+                    matches[mag_uid] = phase_uids
+
+            else:
+                matches = {}
+                mag_times = mag_df.groupby('seriesuid')['seriesnumber'].mean()
+                phase_times = phase_df.groupby('seriesuid')['seriesnumber'].mean()
+                for mag_uid, mag_time in mag_times.items():
+                    time_diff = (phase_times - mag_time).abs()
+                    min_time_diff = time_diff.min()
+                    phase_uids = time_diff.loc[abs(time_diff - min_time_diff) <= 2].index.tolist()
+                    matches[mag_uid] = phase_uids
+
+
+            for mag_series_uid, mag_series_df in mag_df.groupby('seriesuid'):
+                phase_series_uids = matches[mag_series_uid]
+                phase_series_df = phase_df.loc[phase_df['seriesuid'].isin(phase_series_uids)]
+                print(len(phase_series_df), len(mag_series_df))
+
+                if len(mag_series_df) == len(phase_series_df):
+                    self.complex_difference = False
+                    stack_df = pd.concat([mag_series_df, phase_series_df])
+
+                elif len(mag_series_df) == len(phase_series_df) * 2:
+                    self.complex_difference = True
+                    print('complex difference')
+
+                    max_vals = np.max(np.stack(mag_series_df['image'].values, -1))
+                    mag_series_df['norm_sum'] = mag_series_df['image'].apply(
+                        lambda x: np.sum(x / max_vals)
+                    )
+
+                    chosen_mag_df = mag_series_df.loc[
+                        mag_series_df.groupby('triggertime')['norm_sum'].idxmax()
+                    ].drop(columns='norm_sum').reset_index(drop=True)
+
+                    stack_df = pd.concat([chosen_mag_df, phase_series_df])
+
+                elif len(mag_series_df) * 2 == len(phase_series_df):
+                    self.complex_difference = True
+                    print('complex difference')
+                    phase_series_df['min_val'] = phase_series_df['image'].apply(
+                        lambda x: np.min(x)
+                    )
+
+                    chosen_phase_series_df = (
+                        phase_series_df.loc[
+                            phase_series_df.groupby('triggertime')['min_val'].idxmin()
+                        ]
+                        .drop(columns='min_val')
+                        .reset_index(drop=True)
+                    )
+                    stack_df = pd.concat([mag_series_df, chosen_phase_series_df])
+                    
+                else:
+                    self.missing_data_flag = True
+                    continue
+
+                if len(stack_df) >= 2 * min_timesteps and len(stack_df) <= 2 * max_timesteps:
+                    stack_df_list.append(stack_df)
+
+        return stack_df_list
+
+    def get_stack_df_list(self, dicom_info):
+        stack_df_list = self.get_multi_series_phase_contrast(dicom_info)
+        for stack_df in stack_df_list[:]:
+            if (stack_df['rr'] == 0).all():
+                max_tt = stack_df.triggertime.max()
+                diff_tt = stack_df['triggertime'].diff().dropna()
+                diff_tt = diff_tt.loc[diff_tt > 0]
+                diff_tt = diff_tt.mode()[0]
+                rr = max_tt + diff_tt
+                stack_df['rr'] = rr
+            
+            elif (stack_df['rr'] == 0).any():
+                rrs = stack_df['rr']
+                rrs = rrs.loc[rrs > 0]
+                rr = rrs.median()
+                stack_df['rr'] = rr
+
+        if len(stack_df_list) == 0:
+            raise ValueError('No Phase-Contrasts')
+        
+        return stack_df_list
+
+
+        
+    def get_images(self, stack_df_list):
+        print(len(stack_df_list))
+        if len(stack_df_list) != 1:
+            raise ValueError('Multiple Phase-Contrast Series Found. Please select only one series.')
+        
+        stack_df = stack_df_list[0] # there should only be one series
+
+        if 'ge' in self.manufacturer.lower(): # split phase-contrast into mag and phase
+            mag_df, phase_df = [x for _ , x in stack_df.groupby(stack_df.image.apply(lambda x: x.min()< 0))]
+        else:
+            phase_df, mag_df = [x for _ , x in stack_df.groupby(stack_df['venc'] == 0)]
+
+        mag_df = mag_df.drop_duplicates(subset = ['uid'])
+        mag_tt = mag_df.triggertime.unique()
+        mag_df = mag_df.loc[mag_df['seriesuid'] == mag_df['seriesuid'].iloc[0]]
+        phase_df = phase_df.drop_duplicates(subset = ['uid'])
+        phase_df = phase_df[phase_df['triggertime'].isin(mag_tt)]
+        phase_df = phase_df.loc[phase_df['venc'] == np.max(phase_df['venc'])]
+
+        phase_image = np.stack(phase_df['image'], -1)
+        mag_image = np.stack(mag_df['image'], -1)
+
+        if 'ge' in self.manufacturer.lower(): # GE needs extra processing for velocity
+            vas_flag = phase_df.iloc[0]['vas_flag']
+            if vas_flag != 0:
+                scale = phase_df.iloc[0]['scale']
+                velocity = np.divide(phase_image, mag_image, out=np.zeros_like(phase_image, dtype=float), where=mag_image != 0) * scale
+                phase_image = velocity 
+                
+        ps = float(phase_df.iloc[0].pixelspacing[0])
+        frames = mag_image.shape[-1]
+        ratio = 32/frames
+        mag_image = zoom(mag_image, [ps, ps, ratio], order = 1) # resize magnitude to 1x1x1mm
+        phase_image = zoom(phase_image, [ps, ps, ratio], order = 1) # resize phase to 1x1x1mm
+
+        max_size = 256
+
+        mag_image = tf.image.resize_with_crop_or_pad(mag_image, max_size, max_size) # crop or pad images to 256x256
+        phase_image = tf.image.resize_with_crop_or_pad(phase_image, max_size, max_size)  # crop or pad images to 256x256
+
+        image = np.stack([mag_image, phase_image], -1) # combine magnitude and phase together
+        self.venc = phase_df.venc.max()
+        self.rr =  phase_df.rr.max()
+        description = mag_df.seriesdescription.iloc[0]
+        self.description = description if description else "[empty]"
+        self.patient =  mag_df.patient.iloc[0]
+        studydate =  mag_df.studydate.iloc[0]
+        self.studydate = datetime.strptime(studydate, "%Y%m%d").strftime("%m-%d-%Y")
+        return image
 
 
 def combine_gif_png(gif_path, png_path, output_path):

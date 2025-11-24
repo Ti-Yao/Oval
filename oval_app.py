@@ -49,9 +49,8 @@ if st.session_state["patient_index"] < len(segmentation_list):
     vessel = row['vessel']
     redcap_flow = row['redcap_flow']
 
-    image, venc, rr, description, patient, study_date = get_image(
-        data_path, mag_series_uid, phase_series_uid
-    )
+    p = OvalPipeline(data_path, mag_series_uid, phase_series_uid)
+    image, venc, rr, description, patient, study_date = p.image, p.venc, p.rr, p.description, p.patient, p.studydate
 
     st.markdown(f"**Mag Series UID:** {mag_series_uid}  |  **Phase Series UID:** {phase_series_uid}")
     st.markdown(f"**Patient:** {patient} | **Study Date:** {study_date}  |  **Description:** {description}")
@@ -59,6 +58,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
 
     col1, col2, col3, col4, col5 = st.columns(5)
     mag_image, phase_image = image[..., 0], image[...,1]
+
     slice_2d = mag_image[..., 0]
     print(mag_image.shape)
     slice_2d = (255 * (slice_2d - np.min(slice_2d)) / (np.ptp(slice_2d) + 1e-8)).astype(np.uint8)
@@ -203,7 +203,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 gif_phase_path = st.session_state[gif_cache_key_phase]["path"]
             else:
                 gif_phase_path = f'results/segs/{mag_series_uid}_phase.gif'
-                make_video(phase_image, mask, vessel, gif_phase_path, alpha=0)
+                make_video(imaginary_image, mask, vessel, gif_phase_path, alpha=0)
                 st.session_state[gif_cache_key_phase] = {"path": gif_phase_path, "coords": coords_hash}
 
             display_gif(gif_phase_path, width=display_width)
@@ -268,7 +268,6 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 predicted_df = pd.DataFrame({
                     'patient': [patient],
                     'vessel': [vessel],
-                    'mask': [mask],
                     'mag_series_uid': [mag_series_uid],
                     'phase_series_uid': [phase_series_uid],
                     'description': [description],
@@ -276,10 +275,16 @@ if st.session_state["patient_index"] < len(segmentation_list):
                     'total_volume': [total_volume],
                     'forward_volume': [forward_volume],
                     'backward_volume': [backward_volume],
-                    'flow_curve': [flow_curve],
                     'rr': [rr],
-                    'venc': [venc]
+                    'venc': [venc],
+                    'mask':[mask],
+                    'flow_curve':[flow_curve],
+                    'point1_x': [st.session_state["point1"][0]],
+                    'point1_y': [st.session_state["point1"][1]],
+                    'point2_x': [st.session_state.get("point2")[0] if st.session_state.get("point2") is not None else None],
+                    'point2_y': [st.session_state.get("point2")[1] if st.session_state.get("point2") is not None else None],
                 })
+
                 os.makedirs('results/flow_curves', exist_ok=True)
                 os.makedirs('results/masks', exist_ok=True)
                 os.makedirs('results/dfs', exist_ok=True)
