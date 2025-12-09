@@ -25,6 +25,8 @@ st.subheader("Vessel Segmentation")
 data_path = '/workspaces/vessel/oval/data'
 segmentation_list = pd.read_csv('oval_list.csv')
 
+SCALE = 1.5 # scale everything bigger
+
 if "patient_index" not in st.session_state:
     st.session_state["patient_index"] = 0
 if "point1" not in st.session_state:
@@ -56,13 +58,17 @@ if st.session_state["patient_index"] < len(segmentation_list):
     st.markdown(f"**Patient:** {patient} | **Study Date:** {study_date}  |  **Description:** {description}")
     st.markdown(f"**Vessel:** {vessel.upper()}  |  **RR:** {rr}  |  **VENC:** {venc}")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col3, col4, col5 = st.columns([1.5,1,1,1]) # scale the columns so the editor is bigger
     mag_image, phase_image = image[..., 0], image[...,1]
 
     slice_2d = mag_image[..., 0]
     print(mag_image.shape)
+
+    slice_2d = (slice_2d - np.min(slice_2d))/(np.max(slice_2d) - np.min(slice_2d))
+    slice_2d = skimage.exposure.equalize_adapthist(slice_2d)
+
     slice_2d = (255 * (slice_2d - np.min(slice_2d)) / (np.ptp(slice_2d) + 1e-8)).astype(np.uint8)
-    display_width = slice_2d.shape[0]
+    display_width = int(slice_2d.shape[0] * SCALE)
     os.makedirs('results/segs', exist_ok=True)
     os.makedirs('results/gifs', exist_ok=True)
     os.makedirs('results/curve_plot', exist_ok=True)
@@ -76,7 +82,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
         img1 = Image.fromarray(slice_2d).convert("RGB")
         if st.session_state["point1"] is not None:
             draw1 = ImageDraw.Draw(img1)
-            draw1.ellipse(get_ellipse_coords(st.session_state["point1"]), fill=colorlist[vessel])
+            draw1.ellipse(get_ellipse_coords(st.session_state["point1"], scale = SCALE), fill=colorlist[vessel])
 
         def add_point1():
             raw_value = st.session_state.get("coord1")
@@ -84,7 +90,9 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 st.session_state["point1"] = (raw_value["x"], raw_value["y"])
                 st.session_state["segment"] = False  # mark segmentation outdated
 
-        coords1 = streamlit_image_coordinates(img1, key='coord1', cursor='crosshair', on_click=add_point1, width = image.shape[0])
+        coords1 = streamlit_image_coordinates(img1, key='coord1', cursor='crosshair', on_click=add_point1, width = image.shape[0]* SCALE) # changed
+        if coords1 is not None:
+            x_min1, x_max1, y_min1, y_max1 = get_crop_coords(coords1, scale  = SCALE)# changed
 
         pick_second = st.toggle(
             "Pick a second point?",
@@ -98,7 +106,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
             img2 = Image.fromarray(slice_2d).convert("RGB")
             if st.session_state["point2"] is not None:
                 draw2 = ImageDraw.Draw(img2)
-                draw2.ellipse(get_ellipse_coords(st.session_state["point2"]), fill=colorlist[vessel])
+                draw2.ellipse(get_ellipse_coords(st.session_state["point2"], scale = SCALE), fill=colorlist[vessel])
 
             def add_point2():
                 raw_value = st.session_state.get("coord2")
@@ -106,29 +114,18 @@ if st.session_state["patient_index"] < len(segmentation_list):
                     st.session_state["point2"] = (raw_value["x"], raw_value["y"])
                     st.session_state["segment"] = False
 
-            coords2 = streamlit_image_coordinates(img2, key='coord2', cursor='crosshair', on_click=add_point2, width = image.shape[0])
+            coords2 = streamlit_image_coordinates(img2, key='coord2', cursor='crosshair', on_click=add_point2, width = image.shape[0]* SCALE)# changed
+            if coords2 is not None:
+                x_min2, x_max2, y_min2, y_max2 = get_crop_coords(coords2, scale  = SCALE)# changed
+        else:
+            coords2 = None
+            st.session_state["point2"] = None
 
-    # -------------------------------
-    # Column 2: Cropped images
-    # -------------------------------
-    with col2:
-        if coords1 is not None:
-            st.caption("Cropped Image 1:")
-            x_min1, x_max1, y_min1, y_max1 = get_crop_coords(coords1)
-            st.image(slice_2d[y_min1:y_max1, x_min1:x_max1], width=display_width)
-
-        if coords2 is not None:
-            st.caption("Cropped Image 2:")
-            x_min2, x_max2, y_min2, y_max2 = get_crop_coords(coords2)
-            st.image(slice_2d[y_min2:y_max2, x_min2:x_max2], width=display_width)
-
-        if coords1 is not None and st.button("Segment Images!", type="primary", key="segment_button", width=display_width):
-            st.session_state.segment = True
 
     # -------------------------------
     # Column 3–5: Segmentation, GIF caching, flow, save
     # -------------------------------
-    if st.session_state.segment and coords1 is not None:
+    if coords1 is not None:
         seg_key = mag_series_uid
         coords_hash = (st.session_state["point1"], st.session_state["point2"])
 
@@ -153,14 +150,14 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 with st.spinner("Segmenting Images..."):
                     plot_image1, plot_mask1, pred_mask1 = segment_image(image, venc, model, x_min1, x_max1, y_min1, y_max1)
                     gif_path1 = f"results/temp_point1.gif"
-                    make_video(plot_image1, plot_mask1, vessel, gif_path1)
+                    make_video(plot_image1, plot_mask1, vessel, gif_path1, display_width = display_width)
                     pred_masks.append(pred_mask1)
                     gif_paths.append(gif_path1)
 
-                    if coords2 is not None:
+                    if coords2 is not None and pick_second == True:
                         plot_image2, plot_mask2, pred_mask2 = segment_image(image, venc, model, x_min2, x_max2, y_min2, y_max2)
                         gif_path2 = f"results/temp_point2.gif"
-                        make_video(plot_image2, plot_mask2, vessel, gif_path2)
+                        make_video(plot_image2, plot_mask2, vessel, gif_path2, display_width = display_width)
                         pred_masks.append(pred_mask2)
                         gif_paths.append(gif_path2)
 
@@ -173,7 +170,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
 
             for idx, file_path in enumerate(gif_paths, start=1):
                 st.caption(f"Mask {idx}:")
-                display_gif(file_path, width=display_width)
+                st.image(file_path)
 
         # -------------------------------
         # Compute flows and display
@@ -190,12 +187,11 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 gif_path = st.session_state[gif_cache_key_mag]["path"]
             else:
                 gif_path = f'results/segs/{mag_series_uid}.gif'
-                make_video(mag_image, mask, vessel, gif_path)
+                make_video(mag_image, mask, vessel, gif_path, display_width = display_width)
                 st.session_state[gif_cache_key_mag] = {"path": gif_path, "coords": coords_hash}
 
-            display_gif(gif_path, width=display_width)
+            st.image(gif_path)
             
-            st.markdown("<br>", unsafe_allow_html=True)
             st.caption("Corresponding Phase GIF:")
 
             # Phase GIF cache
@@ -203,10 +199,10 @@ if st.session_state["patient_index"] < len(segmentation_list):
                 gif_phase_path = st.session_state[gif_cache_key_phase]["path"]
             else:
                 gif_phase_path = f'results/segs/{mag_series_uid}_phase.gif'
-                make_video(imaginary_image, mask, vessel, gif_phase_path, alpha=0)
+                make_video(phase_image, mask, vessel, gif_phase_path, alpha=0, display_width = display_width)
                 st.session_state[gif_cache_key_phase] = {"path": gif_phase_path, "coords": coords_hash}
 
-            display_gif(gif_phase_path, width=display_width)
+            st.image(gif_phase_path)
 
 
         # -------------------------------
@@ -241,7 +237,7 @@ if st.session_state["patient_index"] < len(segmentation_list):
             st.caption("Flows:")
             st.markdown(f"""
                 <table style="
-                    width:{int(display_width * 0.9)}px;
+                    width:{int(display_width * 0.7)}px;
                     border-collapse:collapse;
                     background-color:#F7F7F7;
                     font-size:16px;

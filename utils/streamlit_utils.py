@@ -26,6 +26,7 @@ from array_ops import *
 from losses import *
 from layer_util import *
 from unet3plus import *
+import imageio
 
 vessels_dict = {'lpa':1,'rpa':2,'ao':3,'svc':4,'ivc':5}
 skip = 5
@@ -90,32 +91,62 @@ def create_complex_image(magnitude, phase): # magnitude is a real number tensor;
     
     return complex_image
 
-def make_video(image, pred_mask, vessel, save_path, alpha = 0.5):
-    fig, ax = plt.subplots(1,1, figsize = (5,5))
+def make_video(image, pred_mask, vessel, save_file, display_width, alpha=0.5, scale=1):
+    timesteps = image.shape[2]
+    H, W = image.shape[:2]
+
+    H_scaled = W_scaled = display_width
+    img_min, img_max = np.min(image), np.max(image)
+
+    # Resize the input arrays to the scaled size
+    image_resized = np.zeros((H_scaled, W_scaled, timesteps), dtype=image.dtype)
+    pred_mask_resized = np.zeros((H_scaled, W_scaled, timesteps), dtype=pred_mask.dtype)
+
+    for t in range(timesteps):
+        image_resized[:,:,t] = np.array(
+            Image.fromarray(image[:,:,t]).resize((W_scaled, H_scaled), Image.NEAREST)
+        )
+        pred_mask_resized[:,:,t] = np.array(
+            Image.fromarray(pred_mask[:,:,t]).resize((W_scaled, H_scaled), Image.NEAREST)
+        )
+
     frames = []
-    for i in range(image.shape[2]):
-        p1 = ax.imshow(image[...,i],cmap = 'gray', vmin = np.min(image), vmax = np.max(image))
-        text = plt.text(0,-5, f"Frame = {i}")
+    cmap = np.array(colormaps[vessel](np.linspace(0,1,256))[:,:3] * 255, dtype=np.uint8)
 
-        ax.axis('off')
-        artists = [p1,text]
-        artists.append(ax.imshow(pred_mask[...,i],alpha = pred_mask[...,i] * alpha, cmap = colormaps[vessel]))
-        frames.append(artists)
-    ani = animation.ArtistAnimation(fig, frames)
-    plt.subplots_adjust(left = 0, right = 1, bottom = 0, top = 1)
-    ani.save(f'{save_path}', fps=image.shape[2])
-    plt.close()
-        
+    for t in range(timesteps):
+        # Black background
+        img_pil = Image.new("RGBA", (W_scaled, H_scaled), color=(0,0,0,255))
 
-def get_crop_coords(coords):
-    x, y = coords['x'], coords['y']
+        # Base grayscale image
+        img_slice = ((image_resized[:,:,t] - img_min) / (img_max - img_min + 1e-9) * 255).astype(np.uint8)
+        img_rgb = np.stack([img_slice]*3, axis=-1)
+        img_rgb_pil = Image.fromarray(img_rgb, mode="RGB").convert("RGBA")
+
+        # Overlay mask
+        mask_slice = pred_mask_resized[:,:,t]
+        overlay = np.zeros((H_scaled, W_scaled, 4), dtype=np.uint8)
+        if np.any(mask_slice):
+            overlay[:,:,:3] = cmap[(mask_slice*255).astype(int)]
+            overlay[:,:,3] = (mask_slice * alpha * 255).astype(np.uint8)
+        overlay_pil = Image.fromarray(overlay, mode="RGBA")
+
+        img_rgb_pil.alpha_composite(overlay_pil)
+        img_pil.alpha_composite(img_rgb_pil)
+
+        frames.append(img_pil.convert("RGB"))
+
+    imageio.mimsave(save_file, frames, fps=image.shape[2], loop = 0)
+
+
+def get_crop_coords(coords, scale):
+    x, y = int(coords['x']/scale), int(coords['y']/scale)
     x_min, x_max = x - image_size//2, x + image_size//2
     y_min, y_max = y - image_size//2, y + image_size//2
     return x_min, x_max, y_min, y_max
 
 def segment_image(image, venc, model, x_min, x_max, y_min, y_max):
     mag_image = image[...,0]
-    phase_image = image[...,0] # ************************************************* THIS NEEDS CHANGING IF THE MODEL CHANGES *************************************************
+    phase_image = image[...,0]
     mag_image[mag_image<1e-10] = 0                
     max_val = np.max(phase_image)
     angles = phase2angle(phase_image, venc)
@@ -165,22 +196,10 @@ def interpolate_curve(curve, phase_vessel_rr):
     x_new = np.arange(0, round(phase_vessel_rr))
     return cs(x_new)
 
-def get_crop_coords(coords):
-    x, y = coords['x'], coords['y']
-    x_min, x_max = x - image_size//2, x + image_size//2
-    y_min, y_max = y - image_size//2, y + image_size//2
-    return x_min, x_max, y_min, y_max
-
-def display_gif(file_path, width):
-    """Display a GIF in Streamlit from a file path."""
-    with open(file_path, "rb") as f:
-        contents = f.read()
-    data_url = base64.b64encode(contents).decode("utf-8")
-    st.markdown(f'<img src="data:image/gif;base64,{data_url}" width="{width}">', unsafe_allow_html=True)
-
-
-def get_ellipse_coords(point, radius=5):
+def get_ellipse_coords(point, scale, radius=4):
     x, y = point
+    x = int(x/scale)
+    y = int(y/scale)
     return (x - radius, y - radius, x + radius, y + radius)
 
 
